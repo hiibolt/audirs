@@ -1,0 +1,14 @@
+[package]
+name = "audirs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pinned versions — recorded per Phase 0. Do not bump without flagging.
+eframe = "=0.35.0"          # egui + windowing bootstrap
+egui = "=0.35.0"            # immediate-mode UI primitives
+egui_plot = "=0.36.0"       # pitch ribbon + formant scatter (egui_plot is +1 vs egui)
+cpal = "=0.18.1"            # cross-platform realtime mic capture
+rtrb = "=0.3.4"             # lock-free SPSC ring buffer (audio -> UI)
+loqa-voice-dsp = "=0.5.0"   # pitch (pYIN), LPC formants, H1-H2
+hound = "=3.5.1"            # WAV reader for the --analyze validation harness
