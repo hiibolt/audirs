@@ -4,39 +4,23 @@
 //! prints per-frame and summary F0 / F1 / F2 / weight, so the output can be
 //! compared against a reference (Praat) on the same recording.
 //!
-//! Usage: `audirs --analyze path/to/sustained_vowel.wav`
+//! Usage: `audirs --analyze path/to/sustained_vowel.{wav,ogg,mp3}`
+
+use std::path::Path;
+
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 use crate::dsp::{DspConfig, DspEngine};
 use crate::types::VoiceFrame;
 
 pub fn run(path: &str) -> Result<(), String> {
-    let mut reader = hound::WavReader::open(path).map_err(|e| format!("open {path}: {e}"))?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let sample_rate = spec.sample_rate;
-
-    // Decode to mono f32 regardless of source format.
-    let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect(),
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.unwrap_or(0) as f32 / max)
-                .collect()
-        }
-    };
-    let mono: Vec<f32> = if channels <= 1 {
-        interleaved
-    } else {
-        interleaved
-            .chunks(channels)
-            .map(|c| c.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
+    let (mono, sample_rate, channels) = decode_to_mono(path)?;
 
     let cfg = DspConfig::for_sample_rate(sample_rate);
     let mut engine = DspEngine::new(cfg)?;

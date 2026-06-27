@@ -11,4 +11,5 @@ egui_plot = "=0.36.0"       # pitch ribbon + formant scatter (egui_plot is +1 vs
 cpal = "=0.18.1"            # cross-platform realtime mic capture
 rtrb = "=0.3.4"             # lock-free SPSC ring buffer (audio -> UI)
 loqa-voice-dsp = "=0.5.0"   # pitch (pYIN), LPC formants, H1-H2
-hound = "=3.5.1"            # WAV reader for the --analyze validation harness
+# Audio decoder for the --analyze validation harness (ogg/vorbis/mp3/wav).
+symphonia = { version = "=0.5.4", features = ["mp3", "vorbis", "ogg", "wav", "pcm"] }
