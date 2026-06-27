@@ -52,9 +52,28 @@ pub struct AudioEngine {
     _stream: cpal::Stream,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    lost: Arc<AtomicBool>,
     pub sample_rate: u32,
     pub device_name: String,
     pub controls: Arc<AudioControls>,
+}
+
+impl AudioEngine {
+    /// True once the input stream has reported an error (e.g. device unplugged).
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
+
+/// Names of available input devices (for the device picker).
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devs) => devs
+            .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 impl Drop for AudioEngine {
@@ -69,13 +88,30 @@ impl Drop for AudioEngine {
 /// Open the default input device and start capture + analysis.
 ///
 /// Returns the engine (keep it alive!) and a consumer the UI drains for frames.
-pub fn start() -> Result<(AudioEngine, Consumer<VoiceFrame>), String> {
+pub fn start(
+    preferred: Option<&str>,
+) -> Result<(AudioEngine, Consumer<VoiceFrame>), String> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no default input device found".to_string())?;
-    // cpal 0.18 DeviceTrait no longer exposes a name(); device picking is Phase 6.
-    let device_name = "default input".to_string();
+    // Use the preferred device by name if present, else the system default.
+    let device = match preferred {
+        Some(name) => host
+            .input_devices()
+            .ok()
+            .and_then(|mut devs| {
+                devs.find(|d| {
+                    d.description().ok().map(|x| x.name() == name).unwrap_or(false)
+                })
+            })
+            .or_else(|| host.default_input_device())
+            .ok_or_else(|| "no input device available".to_string())?,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| "no default input device found".to_string())?,
+    };
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "input".to_string());
 
     let supported = device
         .default_input_config()
@@ -112,7 +148,12 @@ pub fn start() -> Result<(AudioEngine, Consumer<VoiceFrame>), String> {
             let _ = sample_prod.push(mono);
         }
     };
-    let err_cb = |e| eprintln!("audio stream error: {e}");
+    let lost = Arc::new(AtomicBool::new(false));
+    let lost_cb = lost.clone();
+    let err_cb = move |e| {
+        eprintln!("audio stream error: {e}");
+        lost_cb.store(true, Ordering::Relaxed);
+    };
 
     let stream = device
         .build_input_stream::<f32, _, _>(config, data_cb, err_cb, None)
@@ -130,6 +171,7 @@ pub fn start() -> Result<(AudioEngine, Consumer<VoiceFrame>), String> {
             _stream: stream,
             stop,
             worker: Some(worker),
+            lost,
             sample_rate,
             device_name,
             controls,

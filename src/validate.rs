@@ -76,6 +76,104 @@ pub fn run(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Diagnostic: sweep LPC order on a steady mid-file window and dump the raw
+/// formant output (f1/f2/f3/confidence) straight from loqa, unfiltered.
+pub fn sweep(path: &str) -> Result<(), String> {
+    let (mono, sample_rate, _ch) = decode_to_mono(path)?;
+    println!("# formant-sweep {path}  ({sample_rate} Hz, {} samples)", mono.len());
+    // Take a 2048-sample window from the middle (steady portion).
+    let frame = 2048.min(mono.len());
+    let start = mono.len().saturating_sub(frame) / 2;
+    let window = &mono[start..start + frame];
+    println!("# {:>5}  {:>7}  {:>7}  {:>7}  {:>5}", "order", "f1", "f2", "f3", "conf");
+    for order in [8usize, 10, 12, 14, 16, 18, 20, 24] {
+        match loqa_voice_dsp::formants::extract_formants(window, sample_rate, order) {
+            Ok(r) => println!(
+                "  {order:>5}  {:>7.1}  {:>7.1}  {:>7.1}  {:>5.2}",
+                r.f1, r.f2, r.f3, r.confidence
+            ),
+            Err(e) => println!("  {order:>5}  error: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Decode any supported file (wav/ogg/mp3) to mono f32 + its sample rate.
+/// Returns `(samples, sample_rate, source_channel_count)`.
+fn decode_to_mono(path: &str) -> Result<(Vec<f32>, u32, usize), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("probe failed (unsupported format?): {e}"))?;
+    let mut format = probed.format;
+
+    let track = format
+        .default_track()
+        .ok_or_else(|| "no default audio track".to_string())?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("no decoder for codec: {e}"))?;
+
+    let mut interleaved: Vec<f32> = Vec::new();
+    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let mut channels = 1usize;
+    let mut sbuf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymError::IoError(_)) => break, // end of stream
+            Err(e) => return Err(format!("read error: {e}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                if sbuf.is_none() {
+                    let spec = *audio_buf.spec();
+                    sample_rate = spec.rate;
+                    channels = spec.channels.count().max(1);
+                    sbuf = Some(SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec));
+                }
+                if let Some(buf) = sbuf.as_mut() {
+                    buf.copy_interleaved_ref(audio_buf);
+                    interleaved.extend_from_slice(buf.samples());
+                }
+            }
+            Err(SymError::DecodeError(_)) => continue, // skip bad packet
+            Err(e) => return Err(format!("decode error: {e}")),
+        }
+    }
+
+    if sample_rate == 0 || interleaved.is_empty() {
+        return Err("decoded zero audio samples".to_string());
+    }
+
+    let mono: Vec<f32> = if channels <= 1 {
+        interleaved
+    } else {
+        interleaved
+            .chunks(channels)
+            .map(|c| c.iter().sum::<f32>() / channels as f32)
+            .collect()
+    };
+    Ok((mono, sample_rate, channels))
+}
+
 fn fmt(v: Option<f32>) -> String {
     match v {
         Some(x) => format!("{x:.1}"),

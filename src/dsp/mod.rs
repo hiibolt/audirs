@@ -8,10 +8,11 @@
 
 use loqa_voice_dsp::analyzer::VoiceAnalyzer;
 use loqa_voice_dsp::config::AnalysisConfig;
-use loqa_voice_dsp::formants::extract_formants;
 use loqa_voice_dsp::h1h2::calculate_h1h2;
 
 use crate::types::VoiceFrame;
+
+pub mod formants;
 
 /// Tunables for analysis. Sensible defaults are derived from the sample rate.
 #[derive(Clone, Copy, Debug)]
@@ -101,11 +102,10 @@ impl DspEngine {
             return VoiceFrame::silent(timestamp_ms, rms);
         }
 
-        // --- Formants (LPC) ---
-        let (f1, f2) = match extract_formants(samples, self.cfg.sample_rate, self.cfg.lpc_order) {
-            Ok(r) => (sane_formant(r.f1), sane_formant(r.f2)),
-            Err(_) => (None, None),
-        };
+        // --- Formants (our own LPC extractor) ---
+        let fmts = formants::extract(samples, self.cfg.sample_rate);
+        let f1 = fmts.first().copied().and_then(sane_formant);
+        let f2 = fmts.get(1).copied().and_then(sane_formant);
 
         // --- Vocal weight (H1-H2) ---
         let weight = calculate_h1h2(samples, self.cfg.sample_rate, f0)

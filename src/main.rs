@@ -3,6 +3,7 @@
 
 mod audio;
 mod dsp;
+mod settings;
 mod types;
 mod ui;
 mod validate;
@@ -12,6 +13,15 @@ use ui::VoiceApp;
 fn main() -> eframe::Result<()> {
     // Offline validation mode: `audirs --analyze file.wav` (Phase 2/3 gates).
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--formant-sweep") {
+        if let Some(path) = args.get(pos + 1) {
+            if let Err(e) = validate::sweep(path) {
+                eprintln!("sweep failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if let Some(pos) = args.iter().position(|a| a == "--analyze") {
         match args.get(pos + 1) {
             Some(path) => {
