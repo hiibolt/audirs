@@ -18,3 +18,26 @@ Features include:
   - Input device select
   - Volume booster
   - Silence threshold
+
+## Getting Started
+### Windows
+**Prerequisites**:
+- [Rust](https://www.rust-lang.org/en-US) 
+
+Download the source for this repository either by using the green Code button above, or the [Git CLI](https://kagi.com/search?q=git+for+windows).
+
+Lastly, run `cargo run` from inside the source directory.
+
+*If you get an error about the build script not being able to run, you may have [SAC](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-frequently-asked-questions) enabled. You can either disable it in Windows settings, or run this software from a directory that's whitelisted on your machine.*
+### Linux
+**Prerequisites**:
+- [Rust](https://www.rust-lang.org/en-US) 
+
+Run the following:
+```bash
+git clone https://github.com/hiibolt/audirs.git
+cd audirs
+cargo run
+```
+
+*If you're a Nix user with Flakes enabled, you can run `nix develop` and `cargo run` without needing to install the Rust toolchain globally. This Nix flake also captures all dependencies you may need for systems that might not otherwise have them, like NixOS!*
