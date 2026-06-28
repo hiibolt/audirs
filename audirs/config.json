@@ -1,15 +1,8 @@
 {
-  "gain": 17.0,
-  "threshold": 0.01,
+  "gain": 7.5,
+  "threshold": 0.012,
   "device": null,
-  "targets": {
-    "pitch_lo": 165.0,
-    "pitch_hi": 220.0,
-    "f1_lo": 350.0,
-    "f1_hi": 850.0,
-    "f2_lo": 1700.0,
-    "f2_hi": 2600.0,
-    "weight_lo": 3.0,
-    "weight_hi": 14.0
-  }
+  "target_gender": "Female",
+  "goal_percent": 1.0,
+  "show_starting": true
 }

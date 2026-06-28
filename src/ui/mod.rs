@@ -35,18 +35,78 @@ pub struct Targets {
 
 impl Default for Targets {
     fn default() -> Self {
+        Self::feminine()
+    }
+}
+
+impl Targets {
+    /// Comfortable feminine reference band.
+    pub const fn feminine() -> Self {
         Self {
-            // Comfortable feminine baseline *band* — capped, not a floor.
             pitch_lo: 165.0,
             pitch_hi: 220.0,
-            // Formant target region (provisional placeholders — validate!).
             f1_lo: 350.0,
             f1_hi: 850.0,
             f2_lo: 1700.0,
             f2_hi: 2600.0,
-            // Vocal weight (H1-H2, dB) band — lighter weight = larger H1-H2.
             weight_lo: 3.0,
             weight_hi: 14.0,
+        }
+    }
+
+    /// Comfortable masculine reference band.
+    pub const fn masculine() -> Self {
+        Self {
+            pitch_lo: 85.0,
+            pitch_hi: 155.0,
+            f1_lo: 300.0,
+            f1_hi: 750.0,
+            f2_lo: 1100.0,
+            f2_hi: 1900.0,
+            weight_lo: -2.0,
+            weight_hi: 6.0,
+        }
+    }
+
+    /// Linear blend between `from` and `to` band edges, by `t` in [0, 1].
+    pub fn lerp(from: Self, to: Self, t: f32) -> Self {
+        let l = |a: f32, b: f32| a + (b - a) * t;
+        Self {
+            pitch_lo: l(from.pitch_lo, to.pitch_lo),
+            pitch_hi: l(from.pitch_hi, to.pitch_hi),
+            f1_lo: l(from.f1_lo, to.f1_lo),
+            f1_hi: l(from.f1_hi, to.f1_hi),
+            f2_lo: l(from.f2_lo, to.f2_lo),
+            f2_hi: l(from.f2_hi, to.f2_hi),
+            weight_lo: l(from.weight_lo, to.weight_lo),
+            weight_hi: l(from.weight_hi, to.weight_hi),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Gender {
+    Male,
+    Female,
+}
+
+impl Gender {
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Male => Self::Female,
+            Self::Female => Self::Male,
+        }
+    }
+    pub fn targets(self) -> Targets {
+        match self {
+            Self::Male => Targets::masculine(),
+            Self::Female => Targets::feminine(),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Male => "Male",
+            Self::Female => "Female",
         }
     }
 }
@@ -65,6 +125,9 @@ const ZONE_FILL: Color32 = Color32::from_rgba_premultiplied(56, 82, 61, 95); // 
 const ZONE_LINE: Color32 = Color32::from_rgb(95, 180, 120);
 const OUT_FILL: Color32 = Color32::from_rgba_premultiplied(46, 29, 29, 50); // soft red
 const OUT_LINE: Color32 = Color32::from_rgb(210, 110, 110);
+// Starting-zone overlay: light blue, drawn under the goal zone for comparison.
+const START_FILL: Color32 = Color32::from_rgba_premultiplied(60, 100, 140, 70);
+const START_LINE: Color32 = Color32::from_rgb(110, 160, 210);
 const ACCENT: Color32 = Color32::from_rgb(235, 110, 175); // pink
 const TRACE: Color32 = ACCENT;
 
@@ -242,6 +305,26 @@ impl VoiceApp {
         }
         (total > 0).then(|| inb as f32 / total as f32)
     }
+
+    /// Mean of `prog(f)` over the last `window_ms` of measurable frames.
+    fn avg<P>(&self, window_ms: u64, prog: P) -> Option<f32>
+    where
+        P: Fn(&VoiceFrame) -> Option<f32>,
+    {
+        let now = self.frames.back()?.timestamp_ms;
+        let cutoff = now.saturating_sub(window_ms);
+        let (mut total, mut sum) = (0u32, 0.0f32);
+        for f in self.frames.iter().rev() {
+            if f.timestamp_ms < cutoff {
+                break;
+            }
+            if let Some(p) = prog(f) {
+                total += 1;
+                sum += p;
+            }
+        }
+        (total > 0).then(|| sum / total as f32)
+    }
 }
 
 impl eframe::App for VoiceApp {
@@ -334,7 +417,58 @@ impl VoiceApp {
         if do_reconnect {
             self.restart_audio();
         }
+
+        self.goal_controls(ui);
         ui.separator();
+    }
+
+    /// Target-gender select, goal-percent slider, and starting-zone overlay.
+    fn goal_controls(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Target").color(INK));
+            let cur = self.settings.target_gender;
+            egui::ComboBox::from_id_salt("gender")
+                .selected_text(cur.label())
+                .show_ui(ui, |ui| {
+                    for opt in [Gender::Female, Gender::Male] {
+                        if ui
+                            .selectable_label(cur == opt, opt.label())
+                            .clicked()
+                            && cur != opt
+                        {
+                            self.settings.target_gender = opt;
+                            changed = true;
+                        }
+                    }
+                });
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("Goal").color(INK));
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.settings.goal_percent, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|s| {
+                            s.trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)
+                        }),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+
+            ui.add_space(12.0);
+            if ui
+                .checkbox(&mut self.settings.show_starting, "Show starting zone")
+                .changed()
+            {
+                changed = true;
+            }
+        });
+        if changed {
+            self.settings.save();
+        }
     }
 
     /// Session trajectory: median pitch per bucket over the whole run.
@@ -343,11 +477,23 @@ impl VoiceApp {
             return;
         }
         ui.label(RichText::new("Session (pitch trend)").strong().color(ACCENT));
-        let t = self.settings.targets;
+        let t = self.settings.effective_targets();
+        let start = self.settings.starting_targets();
+        let show_start = self.settings.show_starting;
         let max_x = self.session.last().map(|p| p[0]).unwrap_or(10.0).max(10.0);
         Plot::new("session").height(120.0).auto_bounds(FIXED).show(ui, |pui| {
             pui.set_plot_bounds(PlotBounds::from_min_max([0.0, 80.0], [max_x, 350.0]));
             pui.polygon(rect_poly(0.0, max_x, 80.0, 350.0, OUT_FILL, OUT_LINE));
+            if show_start {
+                pui.polygon(rect_poly(
+                    0.0,
+                    max_x,
+                    start.pitch_lo as f64,
+                    start.pitch_hi as f64,
+                    START_FILL,
+                    START_LINE,
+                ));
+            }
             pui.polygon(rect_poly(
                 0.0,
                 max_x,
@@ -400,7 +546,7 @@ impl VoiceApp {
 impl VoiceApp {
     fn pitch_ribbon(&self, ui: &mut egui::Ui, x_min: f64, x_max: f64) {
         ui.label(RichText::new("Pitch (F0)").strong().color(ACCENT));
-        let t = self.settings.targets;
+        let t = self.settings.effective_targets();
         // Build continuous segments, breaking at unvoiced gaps.
         let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
         let mut cur: Vec<[f64; 2]> = Vec::new();
@@ -426,6 +572,17 @@ impl VoiceApp {
                 pui.set_plot_bounds(PlotBounds::from_min_max([x_min, 80.0], [x_max, 350.0]));
                 // Soft-red everywhere, light-green target band on top.
                 pui.polygon(rect_poly(x_min, x_max, 80.0, 350.0, OUT_FILL, OUT_LINE));
+                if self.settings.show_starting {
+                    let start = self.settings.starting_targets();
+                    pui.polygon(rect_poly(
+                        x_min,
+                        x_max,
+                        start.pitch_lo as f64,
+                        start.pitch_hi as f64,
+                        START_FILL,
+                        START_LINE,
+                    ));
+                }
                 pui.polygon(rect_poly(
                     x_min,
                     x_max,
@@ -446,7 +603,7 @@ impl VoiceApp {
 
     fn formant_scatter(&self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Formants (F1 × F2)").strong().color(ACCENT));
-        let t = self.settings.targets;
+        let t = self.settings.effective_targets();
         let points: Vec<[f64; 2]> = self
             .frames
             .iter()
@@ -465,6 +622,17 @@ impl VoiceApp {
             .show(ui, |pui| {
                 pui.set_plot_bounds(PlotBounds::from_min_max([xb.0, yb.0], [xb.1, yb.1]));
                 pui.polygon(rect_poly(xb.0, xb.1, yb.0, yb.1, OUT_FILL, OUT_LINE));
+                if self.settings.show_starting {
+                    let start = self.settings.starting_targets();
+                    pui.polygon(rect_poly(
+                        start.f1_lo as f64,
+                        start.f1_hi as f64,
+                        start.f2_lo as f64,
+                        start.f2_hi as f64,
+                        START_FILL,
+                        START_LINE,
+                    ));
+                }
                 pui.polygon(rect_poly(
                     t.f1_lo as f64,
                     t.f1_hi as f64,
@@ -491,11 +659,18 @@ impl VoiceApp {
     fn right_column(&self, ui: &mut egui::Ui) {
         let latest = self.latest_voiced();
         let level = self.frames.back().map(|f| f.rms).unwrap_or(0.0);
-        let t = self.settings.targets;
+        let t = self.settings.effective_targets();
         let weight = latest.and_then(|f| f.weight);
 
         ui.label(RichText::new("Vocal weight (H1–H2)").strong().color(ACCENT));
-        weight_gauge(ui, weight, t.weight_lo, t.weight_hi);
+        let start_band = self
+            .settings
+            .show_starting
+            .then(|| {
+                let s = self.settings.starting_targets();
+                (s.weight_lo, s.weight_hi)
+            });
+        weight_gauge(ui, weight, t.weight_lo, t.weight_hi, start_band);
 
         ui.add_space(16.0);
         ui.label(RichText::new("Input level").strong().color(ACCENT));
@@ -505,7 +680,23 @@ impl VoiceApp {
         ui.add_space(16.0);
         ui.label(RichText::new("In band").strong().color(ACCENT));
 
-        // Per-metric in-band predicates (None when the metric isn't measurable).
+        if self.settings.show_starting {
+            self.inband_bipolar(ui, t);
+        } else {
+            self.inband_unipolar(ui, t);
+        }
+
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Target bands are population starting points, not goals.")
+                .italics()
+                .size(11.0)
+                .color(INK),
+        );
+    }
+
+    /// In-band grid as fraction-in-band bars (no starting-zone overlay).
+    fn inband_unipolar(&self, ui: &mut egui::Ui, t: Targets) {
         let pitch_pred = |f: &VoiceFrame| f.f0.map(|v| v >= t.pitch_lo && v <= t.pitch_hi);
         let fmt_pred = |f: &VoiceFrame| match (f.f1, f.f2) {
             (Some(a), Some(b)) => {
@@ -515,7 +706,6 @@ impl VoiceApp {
         };
         let wt_pred = |f: &VoiceFrame| f.weight.map(|v| v >= t.weight_lo && v <= t.weight_hi);
 
-        // "Now" = the most recent measurable frame: 1.0 in band, 0.0 out, None absent.
         let now = |pred: &dyn Fn(&VoiceFrame) -> Option<bool>| -> Option<f32> {
             self.frames
                 .iter()
@@ -553,14 +743,57 @@ impl VoiceApp {
                 self.frac(30_000, &wt_pred),
             );
         });
+    }
 
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("Target bands are population starting points, not goals.")
-                .italics()
-                .size(11.0)
-                .color(INK),
-        );
+    /// In-band grid as bipolar gauges: bottom = deep in starting zone (blue),
+    /// middle stroke = halfway, top = at/past the goal zone (green).
+    fn inband_bipolar(&self, ui: &mut egui::Ui, t: Targets) {
+        let s = self.settings.starting_targets();
+
+        let pitch_prog =
+            |f: &VoiceFrame| f.f0.map(|v| progress_1d(v, s.pitch_lo, s.pitch_hi, t.pitch_lo, t.pitch_hi));
+        let fmt_prog = |f: &VoiceFrame| match (f.f1, f.f2) {
+            (Some(a), Some(b)) => Some(progress_2d(a, b, &s, &t)),
+            _ => None,
+        };
+        let wt_prog = |f: &VoiceFrame| {
+            f.weight
+                .map(|v| progress_1d(v, s.weight_lo, s.weight_hi, t.weight_lo, t.weight_hi))
+        };
+
+        let now = |prog: &dyn Fn(&VoiceFrame) -> Option<f32>| -> Option<f32> {
+            self.frames.iter().rev().find_map(prog)
+        };
+
+        egui::Grid::new("inband").spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label(RichText::new("").color(INK));
+            for h in ["now", "5s", "30s"] {
+                ui.label(RichText::new(h).color(INK));
+            }
+            ui.end_row();
+
+            bipolar_row(
+                ui,
+                "Pitch",
+                now(&pitch_prog),
+                self.avg(5_000, &pitch_prog),
+                self.avg(30_000, &pitch_prog),
+            );
+            bipolar_row(
+                ui,
+                "Formants",
+                now(&fmt_prog),
+                self.avg(5_000, &fmt_prog),
+                self.avg(30_000, &fmt_prog),
+            );
+            bipolar_row(
+                ui,
+                "Weight",
+                now(&wt_prog),
+                self.avg(5_000, &wt_prog),
+                self.avg(30_000, &wt_prog),
+            );
+        });
     }
 }
 
@@ -586,7 +819,13 @@ fn rect_poly(x0: f64, x1: f64, y0: f64, y1: f64, fill: Color32, line: Color32) -
 
 /// Horizontal weight gauge: a tiny plot with a shaded target band and a marker
 /// line at the current H1–H2 value. (Plot-based to reuse the band styling.)
-fn weight_gauge(ui: &mut egui::Ui, value: Option<f32>, lo: f32, hi: f32) {
+fn weight_gauge(
+    ui: &mut egui::Ui,
+    value: Option<f32>,
+    lo: f32,
+    hi: f32,
+    starting: Option<(f32, f32)>,
+) {
     let (dmin, dmax) = (-5.0f64, 22.0f64);
     Plot::new("weight")
         .height(56.0)
@@ -596,6 +835,16 @@ fn weight_gauge(ui: &mut egui::Ui, value: Option<f32>, lo: f32, hi: f32) {
         .show(ui, |pui| {
             pui.set_plot_bounds(PlotBounds::from_min_max([dmin, 0.0], [dmax, 1.0]));
             pui.polygon(rect_poly(dmin, dmax, 0.0, 1.0, OUT_FILL, OUT_LINE));
+            if let Some((slo, shi)) = starting {
+                pui.polygon(rect_poly(
+                    slo as f64,
+                    shi as f64,
+                    0.0,
+                    1.0,
+                    START_FILL,
+                    START_LINE,
+                ));
+            }
             pui.polygon(rect_poly(lo as f64, hi as f64, 0.0, 1.0, ZONE_FILL, ZONE_LINE));
             if let Some(v) = value {
                 pui.line(
@@ -643,4 +892,108 @@ fn bar_cell(ui: &mut egui::Ui, frac: Option<f32>) {
 fn lerp_red_green(f: f32) -> Color32 {
     let f = f.clamp(0.0, 1.0);
     Color32::from_rgb((40.0 + (1.0 - f) * 200.0) as u8, (40.0 + f * 180.0) as u8, 60)
+}
+
+/// Map a 1D value `v` to a bipolar progress in [-1, 1]: -1 at the starting
+/// band's center, +1 at the goal band's center, linearly interpolated.
+fn progress_1d(v: f32, s_lo: f32, s_hi: f32, g_lo: f32, g_hi: f32) -> f32 {
+    let s_c = (s_lo + s_hi) * 0.5;
+    let g_c = (g_lo + g_hi) * 0.5;
+    let denom = g_c - s_c;
+    if denom.abs() < 1e-6 {
+        return 0.0;
+    }
+    let t = (v - s_c) / denom;
+    (2.0 * t - 1.0).clamp(-1.0, 1.0)
+}
+
+/// 2D version: project (v1, v2) onto the axis from the starting-zone center to
+/// the goal-zone center, then map to [-1, 1] the same way.
+fn progress_2d(v1: f32, v2: f32, s: &Targets, g: &Targets) -> f32 {
+    let s1 = (s.f1_lo + s.f1_hi) * 0.5;
+    let s2 = (s.f2_lo + s.f2_hi) * 0.5;
+    let g1 = (g.f1_lo + g.f1_hi) * 0.5;
+    let g2 = (g.f2_lo + g.f2_hi) * 0.5;
+    let dx = g1 - s1;
+    let dy = g2 - s2;
+    let denom = dx * dx + dy * dy;
+    if denom < 1e-6 {
+        return 0.0;
+    }
+    let t = ((v1 - s1) * dx + (v2 - s2) * dy) / denom;
+    (2.0 * t - 1.0).clamp(-1.0, 1.0)
+}
+
+/// One Grid row of bipolar gauges (now / 5s / 30s).
+fn bipolar_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    now: Option<f32>,
+    w5: Option<f32>,
+    w30: Option<f32>,
+) {
+    ui.label(RichText::new(label).color(INK));
+    bipolar_cell(ui, now);
+    bipolar_cell(ui, w5);
+    bipolar_cell(ui, w30);
+    ui.end_row();
+}
+
+/// Bipolar gauge cell: middle stroke is the midpoint between the starting and
+/// goal zones; the cursor sits below it (toward a blue bottom) when the value
+/// reads as the starting zone, and above it (toward a green top) when it nears
+/// or exceeds the goal zone. Cursor is always drawn when a value is present.
+fn bipolar_cell(ui: &mut egui::Ui, progress: Option<f32>) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 34.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, Color32::from_gray(232)); // track
+    let mid_y = rect.center().y;
+    // Center reference line.
+    p.line_segment(
+        [egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)],
+        egui::Stroke::new(1.0, Color32::from_gray(150)),
+    );
+    if let Some(prog) = progress {
+        let pc = prog.clamp(-1.0, 1.0);
+        let half = rect.height() * 0.5;
+        let cursor_y = mid_y - pc * half;
+        let (top, bot, color) = if pc >= 0.0 {
+            (cursor_y, mid_y, lerp_neutral_green(pc))
+        } else {
+            (mid_y, cursor_y, lerp_neutral_blue(-pc))
+        };
+        if (bot - top).abs() > 0.5 {
+            let filled = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), top),
+                egui::pos2(rect.right(), bot),
+            );
+            p.rect_filled(filled, 2.0, color);
+        }
+        // Cursor: always visible, even at exactly the midpoint.
+        p.line_segment(
+            [
+                egui::pos2(rect.left() - 1.0, cursor_y),
+                egui::pos2(rect.right() + 1.0, cursor_y),
+            ],
+            egui::Stroke::new(2.0, INK),
+        );
+    }
+}
+
+/// Lerp neutral (track gray) → bright green by `f` in [0, 1].
+fn lerp_neutral_green(f: f32) -> Color32 {
+    let f = f.clamp(0.0, 1.0);
+    let r = (210.0 + (95.0 - 210.0) * f) as u8;
+    let g = (210.0 + (180.0 - 210.0) * f) as u8;
+    let b = (210.0 + (120.0 - 210.0) * f) as u8;
+    Color32::from_rgb(r, g, b)
+}
+
+/// Lerp neutral (track gray) → starting-zone blue by `f` in [0, 1].
+fn lerp_neutral_blue(f: f32) -> Color32 {
+    let f = f.clamp(0.0, 1.0);
+    let r = (210.0 + (110.0 - 210.0) * f) as u8;
+    let g = (210.0 + (160.0 - 210.0) * f) as u8;
+    let b = (210.0 + (210.0 - 210.0) * f) as u8;
+    Color32::from_rgb(r, g, b)
 }

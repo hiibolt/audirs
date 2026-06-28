@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ui::Targets;
+use crate::ui::{Gender, Targets};
 
 /// Everything we remember between runs.
 #[derive(Serialize, Deserialize, Clone)]
@@ -15,7 +15,13 @@ pub struct Settings {
     pub threshold: f32,
     /// Preferred input device name; `None` = system default.
     pub device: Option<String>,
-    pub targets: Targets,
+    /// Which gender's reference zone the user is aiming toward.
+    pub target_gender: Gender,
+    /// How far between the starting (opposite-gender) and goal zones to aim,
+    /// as a fraction in [0, 1].
+    pub goal_percent: f32,
+    /// Overlay the starting (opposite-gender) zone in light blue for comparison.
+    pub show_starting: bool,
 }
 
 impl Default for Settings {
@@ -24,8 +30,27 @@ impl Default for Settings {
             gain: 1.0,
             threshold: 0.01,
             device: None,
-            targets: Targets::default(),
+            target_gender: Gender::Female,
+            goal_percent: 1.0,
+            show_starting: false,
         }
+    }
+}
+
+impl Settings {
+    /// The currently-active target band: starting zone blended toward the goal
+    /// zone by `goal_percent`.
+    pub fn effective_targets(&self) -> Targets {
+        Targets::lerp(
+            self.target_gender.opposite().targets(),
+            self.target_gender.targets(),
+            self.goal_percent.clamp(0.0, 1.0),
+        )
+    }
+
+    /// The starting (opposite-gender) reference zone.
+    pub fn starting_targets(&self) -> Targets {
+        self.target_gender.opposite().targets()
     }
 }
 
