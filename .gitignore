@@ -1,3 +1,11 @@
 /target
 /.direnv
+/.vscode
 .envrc
+node_modules
+/build
+/.svelte-kit
+/package
+.DS_Store
+src-tauri/target
+src-tauri/gen

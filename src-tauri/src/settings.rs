@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ui::{Gender, Targets};
+use crate::targets::{Gender, Targets};
 
 /// Everything we remember between runs.
 #[derive(Serialize, Deserialize, Clone)]

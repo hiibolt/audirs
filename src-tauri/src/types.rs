@@ -9,7 +9,7 @@
 /// Every perceptual metric is `Option` because unvoiced frames (silence,
 /// fricatives) have no meaningful pitch or formants. The UI renders `None`
 /// as a gap, never as a zero.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct VoiceFrame {
     /// Monotonic milliseconds since capture start.
     pub timestamp_ms: u64,
