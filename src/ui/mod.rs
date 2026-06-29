@@ -137,6 +137,34 @@ const FIXED: Vec2b = Vec2b { x: false, y: false };
 /// Low, because the mic throws jittery outliers we want to ride over.
 const SMOOTH_ALPHA: f32 = 0.18;
 
+/// Running in-band tally for one metric over the active session.
+#[derive(Default, Clone, Copy)]
+struct InBand {
+    inb: u64,
+    total: u64,
+}
+
+impl InBand {
+    fn add(&mut self, measured: Option<bool>) {
+        if let Some(b) = measured {
+            self.total += 1;
+            self.inb += b as u64;
+        }
+    }
+    fn frac(&self) -> Option<f32> {
+        (self.total > 0).then(|| self.inb as f32 / self.total as f32)
+    }
+}
+
+/// Frozen totals produced when a session is stopped.
+struct SessionSummary {
+    duration_s: f32,
+    median_pitch: Option<f32>,
+    pitch: Option<f32>,
+    fmt: Option<f32>,
+    weight: Option<f32>,
+}
+
 pub struct VoiceApp {
     frames: VecDeque<VoiceFrame>,
     consumer: Option<Consumer<VoiceFrame>>,
@@ -145,9 +173,17 @@ pub struct VoiceApp {
     status: String,
     settings: Settings,
     devices: Vec<String>,
-    // Bucketed median pitch over the whole session: [seconds, Hz].
-    session: Vec<[f64; 2]>,
-    next_bucket_ms: u64,
+    // --- session (user-controlled via Start/Stop) ---
+    session_active: bool,
+    sess_pitch: InBand,
+    sess_fmt: InBand,
+    sess_weight: InBand,
+    sess_start_ms: u64,
+    sess_last_ms: u64,
+    sess_next_bucket_ms: u64,
+    /// Bucketed median pitch over the session: [seconds-since-start, Hz].
+    trend: Vec<[f64; 2]>,
+    summary: Option<SessionSummary>,
     // Exponential-moving-average smoothing state per metric.
     sm_f0: Option<f32>,
     sm_f1: Option<f32>,
@@ -169,8 +205,15 @@ impl VoiceApp {
             status: String::new(),
             settings,
             devices: crate::audio::list_input_devices(),
-            session: Vec::new(),
-            next_bucket_ms: BUCKET_MS,
+            session_active: false,
+            sess_pitch: InBand::default(),
+            sess_fmt: InBand::default(),
+            sess_weight: InBand::default(),
+            sess_start_ms: 0,
+            sess_last_ms: 0,
+            sess_next_bucket_ms: BUCKET_MS,
+            trend: Vec::new(),
+            summary: None,
             sm_f0: None,
             sm_f1: None,
             sm_f2: None,
@@ -189,8 +232,16 @@ impl VoiceApp {
         self.consumer = None;
         self.controls = None;
         self.frames.clear();
-        self.session.clear();
-        self.next_bucket_ms = BUCKET_MS;
+        // A capture restart resets the clock, so any active session ends.
+        self.session_active = false;
+        self.trend.clear();
+        self.summary = None;
+        self.sess_pitch = InBand::default();
+        self.sess_fmt = InBand::default();
+        self.sess_weight = InBand::default();
+        self.sess_start_ms = 0;
+        self.sess_last_ms = 0;
+        self.sess_next_bucket_ms = BUCKET_MS;
         self.sm_f0 = None;
         self.sm_f1 = None;
         self.sm_f2 = None;
@@ -214,21 +265,25 @@ impl VoiceApp {
         }
     }
 
-    /// Drain the ring buffer, smooth each frame, and evict old frames.
+    /// Drain the ring buffer, smooth each frame, accumulate session stats, and
+    /// evict old frames.
     fn pump(&mut self) {
         // Take the consumer out to avoid borrowing self mutably twice.
         if let Some(mut c) = self.consumer.take() {
             while let Ok(raw) = c.pop() {
                 let f = self.smooth_frame(raw);
+                if self.session_active {
+                    self.accumulate(&f);
+                }
                 self.frames.push_back(f);
             }
             self.consumer = Some(c);
         }
         if let Some(&VoiceFrame { timestamp_ms: now, .. }) = self.frames.back() {
-            // Aggregate session-trend buckets before evicting old frames.
-            while now >= self.next_bucket_ms {
-                let lo = self.next_bucket_ms.saturating_sub(BUCKET_MS);
-                let hi = self.next_bucket_ms;
+            // Aggregate session-trend buckets (only while a session runs).
+            while self.session_active && now >= self.sess_next_bucket_ms {
+                let lo = self.sess_next_bucket_ms.saturating_sub(BUCKET_MS);
+                let hi = self.sess_next_bucket_ms;
                 let med = median(
                     self.frames
                         .iter()
@@ -236,9 +291,10 @@ impl VoiceApp {
                         .filter_map(|f| f.f0),
                 );
                 if let Some(m) = med {
-                    self.session.push([hi as f64 / 1000.0, m as f64]);
+                    let x = (hi.saturating_sub(self.sess_start_ms)) as f64 / 1000.0;
+                    self.trend.push([x, m as f64]);
                 }
-                self.next_bucket_ms += BUCKET_MS;
+                self.sess_next_bucket_ms += BUCKET_MS;
             }
 
             let cutoff = now.saturating_sub(HISTORY_MS);
@@ -277,6 +333,49 @@ impl VoiceApp {
             f2: ema(&mut self.sm_f2, raw.f2),
             weight: ema(&mut self.sm_weight, raw.weight),
             rms: self.sm_rms,
+        }
+    }
+
+    /// Fold one frame into the running session tallies (in-band vs the
+    /// currently-effective goal zone).
+    fn accumulate(&mut self, f: &VoiceFrame) {
+        let t = self.settings.effective_targets();
+        self.sess_pitch.add(f.f0.map(|v| v >= t.pitch_lo && v <= t.pitch_hi));
+        self.sess_fmt.add(match (f.f1, f.f2) {
+            (Some(a), Some(b)) => {
+                Some(a >= t.f1_lo && a <= t.f1_hi && b >= t.f2_lo && b <= t.f2_hi)
+            }
+            _ => None,
+        });
+        self.sess_weight
+            .add(f.weight.map(|v| v >= t.weight_lo && v <= t.weight_hi));
+        self.sess_last_ms = f.timestamp_ms;
+    }
+
+    fn start_session(&mut self) {
+        self.session_active = true;
+        self.summary = None;
+        self.trend.clear();
+        self.sess_pitch = InBand::default();
+        self.sess_fmt = InBand::default();
+        self.sess_weight = InBand::default();
+        let now = self.frames.back().map(|f| f.timestamp_ms).unwrap_or(0);
+        self.sess_start_ms = now;
+        self.sess_last_ms = now;
+        self.sess_next_bucket_ms = now + BUCKET_MS;
+    }
+
+    fn stop_session(&mut self) {
+        self.session_active = false;
+        // Generate totals only if the session actually captured something.
+        if self.sess_pitch.total > 0 || !self.trend.is_empty() {
+            self.summary = Some(SessionSummary {
+                duration_s: self.sess_last_ms.saturating_sub(self.sess_start_ms) as f32 / 1000.0,
+                median_pitch: median(self.trend.iter().map(|p| p[1] as f32)),
+                pitch: self.sess_pitch.frac(),
+                fmt: self.sess_fmt.frac(),
+                weight: self.sess_weight.frac(),
+            });
         }
     }
 
@@ -358,28 +457,35 @@ impl eframe::App for VoiceApp {
 
         ui.add_space(8.0);
         self.session_view(ui);
-
-        ui.add_space(8.0);
-        self.mic_controls(ui);
     }
 }
 
 impl VoiceApp {
-    /// Title, status, device picker, and connection/reconnect banner.
+    /// All settings, grouped compactly at the top: title/status, device + mic +
+    /// session controls on one wrapped row, then the goal/gender row.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Voice Trainer").size(20.0).strong().color(ACCENT));
-        ui.label(RichText::new(&self.status).color(INK));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Voice Trainer").size(18.0).strong().color(ACCENT));
+            ui.label(RichText::new(&self.status).color(INK));
+        });
 
         let disconnected = self.engine.as_ref().map_or(true, |e| e.lost());
-        // Clone state out so the egui closures don't borrow `self`.
+        let active = self.session_active;
+        // Clone/copy state out so the egui closures don't borrow `self`.
         let devices = self.devices.clone();
         let current = self.settings.device.clone();
+        let mut gain = self.settings.gain;
+        let mut thr = self.settings.threshold;
         let mut new_device: Option<Option<String>> = None;
         let mut do_reconnect = false;
         let mut rescan = false;
+        let mut mic_changed = false;
+        let mut toggle_session = false;
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().slider_width = 100.0;
+
             ui.label(RichText::new("Input").color(INK));
             let sel = current.clone().unwrap_or_else(|| "System default".to_string());
             egui::ComboBox::from_id_salt("device")
@@ -398,6 +504,25 @@ impl VoiceApp {
             if ui.button("⟳").on_hover_text("Rescan devices").clicked() {
                 rescan = true;
             }
+
+            ui.separator();
+            ui.label(RichText::new("Boost").color(INK));
+            if ui.add(egui::Slider::new(&mut gain, 1.0..=30.0).suffix("×")).changed() {
+                mic_changed = true;
+            }
+            ui.label(RichText::new("Silence").color(INK));
+            if ui
+                .add(egui::Slider::new(&mut thr, 0.0..=0.05).fixed_decimals(3))
+                .changed()
+            {
+                mic_changed = true;
+            }
+
+            ui.separator();
+            let label = if active { "■ Stop session" } else { "▶ Start session" };
+            if ui.button(RichText::new(label).strong()).clicked() {
+                toggle_session = true;
+            }
             if disconnected {
                 ui.label(RichText::new("⚠ disconnected").strong().color(OUT_LINE));
                 if ui.button("Reconnect").clicked() {
@@ -406,6 +531,15 @@ impl VoiceApp {
             }
         });
 
+        if mic_changed {
+            self.settings.gain = gain;
+            self.settings.threshold = thr;
+            if let Some(c) = &self.controls {
+                c.set_gain(gain);
+                c.set_silence_rms(thr);
+            }
+            self.settings.save();
+        }
         if rescan {
             self.devices = crate::audio::list_input_devices();
         }
@@ -416,6 +550,13 @@ impl VoiceApp {
         }
         if do_reconnect {
             self.restart_audio();
+        }
+        if toggle_session {
+            if active {
+                self.stop_session();
+            } else {
+                self.start_session();
+            }
         }
 
         self.goal_controls(ui);
@@ -471,16 +612,38 @@ impl VoiceApp {
         }
     }
 
-    /// Session trajectory: median pitch per bucket over the whole run.
+    /// Session totals (after Stop) and the median-pitch trajectory.
     fn session_view(&self, ui: &mut egui::Ui) {
-        if self.session.len() < 2 {
+        // Frozen totals from the last completed session.
+        if let Some(s) = &self.summary {
+            ui.separator();
+            ui.label(RichText::new("Last session").strong().color(ACCENT));
+            ui.label(
+                RichText::new(format!(
+                    "Duration {:.0}s · median pitch {} · in band — pitch {}, formants {}, weight {}",
+                    s.duration_s,
+                    opt_hz(s.median_pitch),
+                    pct(s.pitch),
+                    pct(s.fmt),
+                    pct(s.weight),
+                ))
+                .color(INK),
+            );
+        }
+
+        if self.trend.len() < 2 {
             return;
         }
-        ui.label(RichText::new("Session (pitch trend)").strong().color(ACCENT));
+        let title = if self.session_active {
+            "Session (pitch trend, live)"
+        } else {
+            "Session (pitch trend)"
+        };
+        ui.label(RichText::new(title).strong().color(ACCENT));
         let t = self.settings.effective_targets();
         let start = self.settings.starting_targets();
         let show_start = self.settings.show_starting;
-        let max_x = self.session.last().map(|p| p[0]).unwrap_or(10.0).max(10.0);
+        let max_x = self.trend.last().map(|p| p[0]).unwrap_or(10.0).max(10.0);
         Plot::new("session").height(120.0).auto_bounds(FIXED).show(ui, |pui| {
             pui.set_plot_bounds(PlotBounds::from_min_max([0.0, 80.0], [max_x, 350.0]));
             pui.polygon(rect_poly(0.0, max_x, 80.0, 350.0, OUT_FILL, OUT_LINE));
@@ -503,44 +666,13 @@ impl VoiceApp {
                 ZONE_LINE,
             ));
             pui.line(
-                Line::new("trend", PlotPoints::from(self.session.clone()))
+                Line::new("trend", PlotPoints::from(self.trend.clone()))
                     .color(ACCENT)
                     .width(2.0),
             );
         });
     }
 
-    /// Mic boost + silence-threshold sliders, pushed live and persisted.
-    fn mic_controls(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Mic boost").color(INK));
-            if ui
-                .add(egui::Slider::new(&mut self.settings.gain, 1.0..=30.0).suffix("×"))
-                .changed()
-            {
-                if let Some(c) = &self.controls {
-                    c.set_gain(self.settings.gain);
-                }
-                changed = true;
-            }
-            ui.add_space(16.0);
-            ui.label(RichText::new("Silence threshold").color(INK));
-            if ui
-                .add(egui::Slider::new(&mut self.settings.threshold, 0.0..=0.05).fixed_decimals(3))
-                .changed()
-            {
-                if let Some(c) = &self.controls {
-                    c.set_silence_rms(self.settings.threshold);
-                }
-                changed = true;
-            }
-        });
-        if changed {
-            self.settings.save();
-        }
-    }
 }
 
 impl VoiceApp {
@@ -716,7 +848,7 @@ impl VoiceApp {
 
         egui::Grid::new("inband").spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label(RichText::new("").color(INK));
-            for h in ["now", "5s", "30s"] {
+            for h in ["now", "5s", "30s", "session"] {
                 ui.label(RichText::new(h).color(INK));
             }
             ui.end_row();
@@ -727,6 +859,7 @@ impl VoiceApp {
                 now(&pitch_pred),
                 self.frac(5_000, &pitch_pred),
                 self.frac(30_000, &pitch_pred),
+                self.sess_pitch.frac(),
             );
             bar_row(
                 ui,
@@ -734,6 +867,7 @@ impl VoiceApp {
                 now(&fmt_pred),
                 self.frac(5_000, &fmt_pred),
                 self.frac(30_000, &fmt_pred),
+                self.sess_fmt.frac(),
             );
             bar_row(
                 ui,
@@ -741,6 +875,7 @@ impl VoiceApp {
                 now(&wt_pred),
                 self.frac(5_000, &wt_pred),
                 self.frac(30_000, &wt_pred),
+                self.sess_weight.frac(),
             );
         });
     }
@@ -767,7 +902,7 @@ impl VoiceApp {
 
         egui::Grid::new("inband").spacing([10.0, 6.0]).show(ui, |ui| {
             ui.label(RichText::new("").color(INK));
-            for h in ["now", "5s", "30s"] {
+            for h in ["now", "5s", "30s", "session"] {
                 ui.label(RichText::new(h).color(INK));
             }
             ui.end_row();
@@ -778,6 +913,7 @@ impl VoiceApp {
                 now(&pitch_prog),
                 self.avg(5_000, &pitch_prog),
                 self.avg(30_000, &pitch_prog),
+                self.sess_pitch.frac(),
             );
             bipolar_row(
                 ui,
@@ -785,6 +921,7 @@ impl VoiceApp {
                 now(&fmt_prog),
                 self.avg(5_000, &fmt_prog),
                 self.avg(30_000, &fmt_prog),
+                self.sess_fmt.frac(),
             );
             bipolar_row(
                 ui,
@@ -792,6 +929,7 @@ impl VoiceApp {
                 now(&wt_prog),
                 self.avg(5_000, &wt_prog),
                 self.avg(30_000, &wt_prog),
+                self.sess_weight.frac(),
             );
         });
     }
@@ -863,11 +1001,13 @@ fn bar_row(
     now: Option<f32>,
     w5: Option<f32>,
     w30: Option<f32>,
+    sess: Option<f32>,
 ) {
     ui.label(RichText::new(label).color(INK));
     bar_cell(ui, now);
     bar_cell(ui, w5);
     bar_cell(ui, w30);
+    bar_cell(ui, sess);
     ui.end_row();
 }
 
@@ -885,6 +1025,22 @@ fn bar_cell(ui: &mut egui::Ui, frac: Option<f32>) {
             let filled = egui::Rect::from_min_max(egui::pos2(rect.left(), top), rect.max);
             p.rect_filled(filled, 2.0, lerp_red_green(f));
         }
+    }
+}
+
+/// Format an optional Hz value for the session summary.
+fn opt_hz(v: Option<f32>) -> String {
+    match v {
+        Some(x) => format!("{x:.0} Hz"),
+        None => "—".to_string(),
+    }
+}
+
+/// Format an optional fraction as a percentage for the session summary.
+fn pct(v: Option<f32>) -> String {
+    match v {
+        Some(x) => format!("{:.0}%", x * 100.0),
+        None => "—".to_string(),
     }
 }
 
@@ -931,11 +1087,15 @@ fn bipolar_row(
     now: Option<f32>,
     w5: Option<f32>,
     w30: Option<f32>,
+    sess: Option<f32>,
 ) {
     ui.label(RichText::new(label).color(INK));
     bipolar_cell(ui, now);
     bipolar_cell(ui, w5);
     bipolar_cell(ui, w30);
+    // Session column is a plain fraction-in-band bar (a "total"), even in
+    // bipolar mode, so it reads as overall progress this session.
+    bar_cell(ui, sess);
     ui.end_row();
 }
 
