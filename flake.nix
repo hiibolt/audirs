@@ -44,6 +44,20 @@
 
                     # udev (cpal device enumeration)
                     udev
+
+                    # Tauri (webview + system integration)
+                    webkitgtk_4_1
+                    gtk3
+                    libsoup_3
+                    dbus
+                    glib
+                    cairo
+                    pango
+                    gdk-pixbuf
+                    atk
+                    harfbuzz
+                    openssl
+                    librsvg
                 ];
 
                 localRustBuild = rustPlatform.buildRustPackage rec {
@@ -53,8 +67,10 @@
                     cargoBuildFlags = "";
 
                     cargoLock = {
-                        lockFile = ./Cargo.lock;
+                        lockFile = ./src-tauri/Cargo.lock;
                     };
+
+                    buildAndTestSubdir = "src-tauri";
 
                     nativeBuildInputs = [
                         (rustVersion.override { extensions = [ "rust-src" ]; })
@@ -93,6 +109,7 @@
                     RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
                     LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
                     WINIT_UNIX_BACKEND = "x11";
+                    GDK_BACKEND = "x11";
 
                     shellHook = ''
                         echo "audirs dev shell — egui + cpal ready"
